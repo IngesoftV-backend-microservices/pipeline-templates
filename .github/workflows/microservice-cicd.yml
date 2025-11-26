@@ -31,11 +31,6 @@ on:
         required: false
         type: boolean
         default: false
-      slack-enabled:
-        description: 'Enable Slack notifications'
-        required: false
-        type: boolean
-        default: false
     secrets:
       SONARQUBE_TOKEN:
         required: false
@@ -356,7 +351,7 @@ jobs:
           fi
 
       - name: Send Slack notification
-        if: ${{ inputs.slack-enabled }}
+        if: false  # Disabled for now
         uses: slackapi/slack-github-action@v1
         with:
           payload: |
