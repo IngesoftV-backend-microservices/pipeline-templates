@@ -92,7 +92,7 @@ jobs:
         run: mvn test -B
 
       - name: Generate test report
-        if: ${{ !inputs.skip-tests && always() }}
+        if: false  # Temporarily disabled - requires additional GitHub token permissions
         uses: dorny/test-reporter@v1
         with:
           name: Unit Tests Results
