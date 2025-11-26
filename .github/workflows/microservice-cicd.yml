@@ -1,0 +1,433 @@
+name: Microservice CI/CD Pipeline
+
+on:
+  workflow_call:
+    inputs:
+      service-name:
+        description: 'Name of the microservice (e.g., user-service)'
+        required: true
+        type: string
+      environment:
+        description: 'Deployment environment (dev or prod)'
+        required: true
+        type: string
+      java-version:
+        description: 'Java version to use'
+        required: false
+        type: string
+        default: '11'
+      maven-version:
+        description: 'Maven version to use'
+        required: false
+        type: string
+        default: '3.9'
+      k8s-namespace:
+        description: 'Kubernetes namespace'
+        required: false
+        type: string
+        default: ''
+      skip-tests:
+        description: 'Skip unit tests'
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      SONARQUBE_TOKEN:
+        required: false
+      SONARQUBE_HOST_URL:
+        required: false
+      SLACK_WEBHOOK_URL:
+        required: false
+
+jobs:
+  build-and-test:
+    name: Build & Test
+    runs-on: self-hosted
+    outputs:
+      version: ${{ steps.gitversion.outputs.semVer }}
+      image-tag: ${{ steps.generate-tag.outputs.tag }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Required for GitVersion
+
+      - name: Set up JDK ${{ inputs.java-version }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ inputs.java-version }}
+          cache: 'maven'
+
+      - name: Install GitVersion
+        uses: gittools/actions/gitversion/setup@v0
+        with:
+          versionSpec: '5.x'
+
+      - name: Determine Version
+        id: gitversion
+        uses: gittools/actions/gitversion/execute@v0
+        with:
+          useConfigFile: false
+          additionalArguments: '/config mode=Mainline'
+
+      - name: Generate image tag
+        id: generate-tag
+        run: |
+          if [ "${{ inputs.environment }}" == "dev" ]; then
+            echo "tag=v${{ steps.gitversion.outputs.semVer }}-dev" >> $GITHUB_OUTPUT
+          else
+            echo "tag=v${{ steps.gitversion.outputs.semVer }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Display version
+        run: |
+          echo "Version: ${{ steps.gitversion.outputs.semVer }}"
+          echo "Image Tag: ${{ steps.generate-tag.outputs.tag }}"
+          echo "Environment: ${{ inputs.environment }}"
+
+      - name: Run unit tests
+        if: ${{ !inputs.skip-tests }}
+        run: mvn test -B
+
+      - name: Generate test report
+        if: ${{ !inputs.skip-tests && always() }}
+        uses: dorny/test-reporter@v1
+        with:
+          name: Unit Tests Results
+          path: target/surefire-reports/*.xml
+          reporter: java-junit
+          fail-on-error: false
+
+      - name: Build with Maven
+        run: mvn clean package -DskipTests -B
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.service-name }}-${{ steps.generate-tag.outputs.tag }}
+          path: target/*.jar
+          retention-days: 7
+
+  code-quality:
+    name: Code Quality Analysis
+    runs-on: self-hosted
+    needs: build-and-test
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK ${{ inputs.java-version }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ inputs.java-version }}
+          cache: 'maven'
+
+      - name: Cache SonarQube packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.sonar/cache
+          key: ${{ runner.os }}-sonar
+          restore-keys: ${{ runner.os }}-sonar
+
+      - name: SonarQube Scan
+        env:
+          SONAR_TOKEN: ${{ secrets.SONARQUBE_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONARQUBE_HOST_URL }}
+        run: |
+          mvn sonar:sonar \
+            -Dsonar.projectKey=${{ inputs.service-name }} \
+            -Dsonar.projectName=${{ inputs.service-name }} \
+            -Dsonar.host.url=${{ secrets.SONARQUBE_HOST_URL }} \
+            -Dsonar.login=${{ secrets.SONARQUBE_TOKEN }} \
+            -Dsonar.qualitygate.wait=true \
+            -B
+
+  security-scan:
+    name: Security Vulnerability Scan
+    runs-on: self-hosted
+    needs: build-and-test
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ inputs.java-version }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ inputs.java-version }}
+          cache: 'maven'
+
+      - name: Build JAR
+        run: mvn clean package -DskipTests -B
+
+      - name: Run Trivy vulnerability scanner on JAR
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: 'target/'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+      - name: Run Trivy vulnerability scanner on Dockerfile
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'config'
+          scan-ref: 'Dockerfile'
+          format: 'table'
+          exit-code: '0'
+          severity: 'CRITICAL,HIGH'
+
+  build-and-push-image:
+    name: Build & Push Docker Image
+    runs-on: self-hosted
+    needs: [build-and-test, code-quality, security-scan]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set ACR name
+        id: acr
+        run: |
+          if [ "${{ inputs.environment }}" == "dev" ]; then
+            echo "name=acrvingesoftdev" >> $GITHUB_OUTPUT
+            echo "login-server=acrvingesoftdev.azurecr.io" >> $GITHUB_OUTPUT
+          else
+            echo "name=acrvingesoftprod" >> $GITHUB_OUTPUT
+            echo "login-server=acrvingesoftprod.azurecr.io" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Login to Azure Container Registry
+        run: az acr login --name ${{ steps.acr.outputs.name }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.acr.outputs.login-server }}/${{ inputs.service-name }}:${{ needs.build-and-test.outputs.image-tag }}
+            ${{ steps.acr.outputs.login-server }}/${{ inputs.service-name }}:latest-${{ inputs.environment }}
+          cache-from: type=registry,ref=${{ steps.acr.outputs.login-server }}/${{ inputs.service-name }}:buildcache-${{ inputs.environment }}
+          cache-to: type=registry,ref=${{ steps.acr.outputs.login-server }}/${{ inputs.service-name }}:buildcache-${{ inputs.environment }},mode=max
+          build-args: |
+            SPRING_PROFILES_ACTIVE=${{ inputs.environment }}
+
+      - name: Run Trivy vulnerability scanner on image
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.acr.outputs.login-server }}/${{ inputs.service-name }}:${{ needs.build-and-test.outputs.image-tag }}
+          format: 'table'
+          exit-code: '0'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Create Git tag
+        if: inputs.environment == 'prod'
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git tag -a "${{ needs.build-and-test.outputs.image-tag }}" -m "Release ${{ needs.build-and-test.outputs.image-tag }}"
+          git push origin "${{ needs.build-and-test.outputs.image-tag }}"
+
+  deploy-to-aks:
+    name: Deploy to AKS
+    runs-on: self-hosted
+    needs: [build-and-test, build-and-push-image]
+    environment: ${{ inputs.environment }}
+
+    steps:
+      - name: Checkout manifests repository
+        uses: actions/checkout@v4
+        with:
+          repository: IngesoftV-backend-microservices/manifests-k8s
+          token: ${{ secrets.GITHUB_TOKEN }}
+          path: manifests
+
+      - name: Set deployment variables
+        id: vars
+        run: |
+          if [ "${{ inputs.environment }}" == "dev" ]; then
+            echo "namespace=ecommerce-dev" >> $GITHUB_OUTPUT
+            echo "cluster-name=aks-ecommerce-dev" >> $GITHUB_OUTPUT
+            echo "resource-group=rg-ecommerce-microservices-dev" >> $GITHUB_OUTPUT
+          else
+            echo "namespace=ecommerce-prod" >> $GITHUB_OUTPUT
+            echo "cluster-name=aks-ecommerce-prod" >> $GITHUB_OUTPUT
+            echo "resource-group=rg-ecommerce-microservices-prod" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Update image tag in kustomization
+        working-directory: manifests/overlays/${{ inputs.environment }}
+        run: |
+          # Update image tag for the specific service
+          kubectl kustomize edit set image \
+            selimhorri/${{ inputs.service-name }}-ecommerce-boot=${{ needs.build-and-push-image.outputs.login-server }}/${{ inputs.service-name }}:${{ needs.build-and-test.outputs.image-tag }}
+
+      - name: Deploy to AKS
+        working-directory: manifests/overlays/${{ inputs.environment }}
+        run: |
+          kubectl apply -k . --namespace=${{ steps.vars.outputs.namespace }}
+
+      - name: Wait for deployment rollout
+        run: |
+          kubectl rollout status deployment/${{ inputs.service-name }} \
+            --namespace=${{ steps.vars.outputs.namespace }} \
+            --timeout=5m
+
+      - name: Verify deployment
+        run: |
+          echo "Deployment verification for ${{ inputs.service-name }}"
+          kubectl get pods -n ${{ steps.vars.outputs.namespace }} -l app=${{ inputs.service-name }}
+          kubectl get svc -n ${{ steps.vars.outputs.namespace }} -l app=${{ inputs.service-name }}
+
+      - name: Health check
+        run: |
+          echo "Running health check for ${{ inputs.service-name }}"
+
+          SERVICE_NAME="${{ inputs.service-name }}"
+          NAMESPACE="${{ steps.vars.outputs.namespace }}"
+
+          # Get service ClusterIP
+          SERVICE_IP=$(kubectl get svc $SERVICE_NAME -n $NAMESPACE -o jsonpath='{.spec.clusterIP}')
+          SERVICE_PORT=$(kubectl get svc $SERVICE_NAME -n $NAMESPACE -o jsonpath='{.spec.ports[0].port}')
+
+          echo "Service IP: $SERVICE_IP:$SERVICE_PORT"
+
+          # Run health check from inside cluster using a temporary pod
+          kubectl run health-check-pod-${{ github.run_id }} \
+            --image=curlimages/curl:latest \
+            --restart=Never \
+            --namespace=$NAMESPACE \
+            --rm -i \
+            --command -- \
+            sh -c "curl -f -s -o /dev/null -w '%{http_code}' http://$SERVICE_IP:$SERVICE_PORT/actuator/health || exit 1"
+
+          if [ $? -eq 0 ]; then
+            echo "✅ Health check passed for ${{ inputs.service-name }}"
+          else
+            echo "❌ Health check failed for ${{ inputs.service-name }}"
+            exit 1
+          fi
+
+  notify:
+    name: Notify Status
+    runs-on: self-hosted
+    needs: [build-and-test, code-quality, security-scan, build-and-push-image, deploy-to-aks]
+    if: always()
+
+    steps:
+      - name: Determine overall status
+        id: status
+        run: |
+          if [ "${{ needs.build-and-test.result }}" == "failure" ] || \
+             [ "${{ needs.code-quality.result }}" == "failure" ] || \
+             [ "${{ needs.security-scan.result }}" == "failure" ] || \
+             [ "${{ needs.build-and-push-image.result }}" == "failure" ] || \
+             [ "${{ needs.deploy-to-aks.result }}" == "failure" ]; then
+            echo "status=failure" >> $GITHUB_OUTPUT
+            echo "emoji=❌" >> $GITHUB_OUTPUT
+          else
+            echo "status=success" >> $GITHUB_OUTPUT
+            echo "emoji=✅" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Send Slack notification
+        if: secrets.SLACK_WEBHOOK_URL != ''
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload: |
+            {
+              "text": "${{ steps.status.outputs.emoji }} Pipeline ${{ steps.status.outputs.status }} for ${{ inputs.service-name }}",
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "${{ steps.status.outputs.emoji }} Pipeline ${{ steps.status.outputs.status }}"
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Service:*\n${{ inputs.service-name }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Environment:*\n${{ inputs.environment }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Version:*\n${{ needs.build-and-test.outputs.image-tag }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Triggered by:*\n${{ github.actor }}"
+                    }
+                  ]
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Status:*\n• Build & Test: ${{ needs.build-and-test.result }}\n• Code Quality: ${{ needs.code-quality.result }}\n• Security Scan: ${{ needs.security-scan.result }}\n• Build Image: ${{ needs.build-and-push-image.result }}\n• Deploy: ${{ needs.deploy-to-aks.result }}"
+                  }
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "View Workflow"
+                      },
+                      "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+      - name: Create GitHub deployment status
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const deployment = await github.rest.repos.createDeployment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: context.sha,
+              environment: '${{ inputs.environment }}',
+              auto_merge: false,
+              required_contexts: []
+            });
+
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: deployment.data.id,
+              state: '${{ steps.status.outputs.status }}',
+              description: 'Deployment ${{ steps.status.outputs.status }} for ${{ inputs.service-name }}',
+              environment: '${{ inputs.environment }}'
+            });
