@@ -308,21 +308,27 @@ jobs:
           SERVICE_IP=$(kubectl get svc $SERVICE_NAME -n $NAMESPACE -o jsonpath='{.spec.clusterIP}')
           SERVICE_PORT=$(kubectl get svc $SERVICE_NAME -n $NAMESPACE -o jsonpath='{.spec.ports[0].port}')
 
+          # Health check URL with service context path
+          HEALTH_URL="http://$SERVICE_IP:$SERVICE_PORT/$SERVICE_NAME/actuator/health"
+
           echo "Service IP: $SERVICE_IP:$SERVICE_PORT"
+          echo "Health URL: $HEALTH_URL"
 
           # Run health check from inside cluster using a temporary pod
-          kubectl run health-check-pod-${{ github.run_id }} \
+          HTTP_CODE=$(kubectl run health-check-pod-${{ github.run_id }} \
             --image=curlimages/curl:latest \
             --restart=Never \
             --namespace=$NAMESPACE \
             --rm -i \
             --command -- \
-            sh -c "curl -f -s -o /dev/null -w '%{http_code}' http://$SERVICE_IP:$SERVICE_PORT/actuator/health || exit 1"
+            sh -c "curl -s -o /dev/null -w '%{http_code}' $HEALTH_URL" || echo "000")
 
-          if [ $? -eq 0 ]; then
+          echo "HTTP Response Code: $HTTP_CODE"
+
+          if [ "$HTTP_CODE" == "200" ]; then
             echo "✅ Health check passed for ${{ inputs.service-name }}"
           else
-            echo "❌ Health check failed for ${{ inputs.service-name }}"
+            echo "❌ Health check failed for ${{ inputs.service-name }} (HTTP $HTTP_CODE)"
             exit 1
           fi
 
