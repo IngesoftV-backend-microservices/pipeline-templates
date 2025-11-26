@@ -31,6 +31,11 @@ on:
         required: false
         type: boolean
         default: false
+      slack-enabled:
+        description: 'Enable Slack notifications'
+        required: false
+        type: boolean
+        default: false
     secrets:
       SONARQUBE_TOKEN:
         required: false
@@ -195,6 +200,8 @@ jobs:
     name: Build & Push Docker Image
     runs-on: self-hosted
     needs: [build-and-test, code-quality, security-scan]
+    outputs:
+      login-server: ${{ steps.acr.outputs.login-server }}
 
     steps:
       - name: Checkout code
@@ -349,7 +356,7 @@ jobs:
           fi
 
       - name: Send Slack notification
-        if: secrets.SLACK_WEBHOOK_URL != ''
+        if: ${{ inputs.slack-enabled }}
         uses: slackapi/slack-github-action@v1
         with:
           payload: |
