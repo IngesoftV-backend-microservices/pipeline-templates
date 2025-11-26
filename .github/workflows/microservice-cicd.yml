@@ -158,30 +158,20 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up JDK ${{ inputs.java-version }}
-        uses: actions/setup-java@v4
+      - name: Download JAR artifact
+        uses: actions/download-artifact@v4
         with:
-          distribution: 'temurin'
-          java-version: ${{ inputs.java-version }}
-          cache: 'maven'
-
-      - name: Build JAR
-        run: mvn clean package -DskipTests -B
+          name: ${{ inputs.service-name }}-${{ needs.build-and-test.outputs.image-tag }}
+          path: target/
 
       - name: Run Trivy vulnerability scanner on JAR
         uses: aquasecurity/trivy-action@master
         with:
           scan-type: 'fs'
           scan-ref: 'target/'
-          format: 'sarif'
-          output: 'trivy-results.sarif'
+          format: 'table'
+          exit-code: '0'
           severity: 'CRITICAL,HIGH'
-
-      - name: Upload Trivy results to GitHub Security
-        uses: github/codeql-action/upload-sarif@v3
-        if: always()
-        with:
-          sarif_file: 'trivy-results.sarif'
 
       - name: Run Trivy vulnerability scanner on Dockerfile
         uses: aquasecurity/trivy-action@master
