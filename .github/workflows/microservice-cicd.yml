@@ -114,7 +114,7 @@ jobs:
         with:
           fetch-depth: 0  # Required for SonarCloud to analyze commit history
 
-      - name: Set up JDK ${{ inputs.java-version }}
+      - name: Set up JDK ${{ inputs.java-version }} for build
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
@@ -137,6 +137,13 @@ jobs:
 
       - name: Run tests with coverage
         run: mvn clean test -B
+
+      - name: Set up JDK 17 for SonarCloud
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'maven'
 
       - name: SonarCloud Scan
         env:
