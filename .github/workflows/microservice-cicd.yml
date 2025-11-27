@@ -31,6 +31,22 @@ on:
         required: false
         type: boolean
         default: false
+    secrets:
+      SONAR_TOKEN:
+        description: 'SonarQube authentication token'
+        required: true
+      AZURE_CLIENT_ID:
+        description: 'Azure Client ID for OIDC authentication'
+        required: true
+      AZURE_TENANT_ID:
+        description: 'Azure Tenant ID'
+        required: true
+      AZURE_SUBSCRIPTION_ID:
+        description: 'Azure Subscription ID'
+        required: true
+      GH_PAT:
+        description: 'GitHub Personal Access Token for accessing other repositories'
+        required: true
 
 jobs:
   build-and-test:
