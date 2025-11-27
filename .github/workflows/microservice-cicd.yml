@@ -217,6 +217,17 @@ jobs:
           java-version: '17'
           cache: 'maven'
 
+      - name: Debug - Check SONAR_TOKEN
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          if [ -z "$SONAR_TOKEN" ]; then
+            echo "ERROR: SONAR_TOKEN is empty!"
+            exit 1
+          else
+            echo "SONAR_TOKEN is set (length: ${#SONAR_TOKEN} characters)"
+          fi
+
       - name: SonarQube Scan
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
