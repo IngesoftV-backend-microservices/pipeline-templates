@@ -112,7 +112,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # Required for SonarCloud to analyze commit history
+          fetch-depth: 0  # Required for SonarQube to analyze commit history
 
       - name: Set up JDK ${{ inputs.java-version }} for build
         uses: actions/setup-java@v4
@@ -121,7 +121,63 @@ jobs:
           java-version: ${{ inputs.java-version }}
           cache: 'maven'
 
-      - name: Cache SonarCloud packages
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Get AKS credentials
+        run: |
+          if [ "${{ inputs.environment }}" == "dev" ]; then
+            az aks get-credentials --resource-group ${{ vars.AKS_RG_DEV }} --name ${{ vars.AKS_CLUSTER_DEV }} --overwrite-existing
+          else
+            az aks get-credentials --resource-group ${{ vars.AKS_RG_PROD }} --name ${{ vars.AKS_CLUSTER_PROD }} --overwrite-existing
+          fi
+
+      - name: Get SonarQube configuration
+        id: sonar-config
+        run: |
+          NAMESPACE="${{ inputs.environment == 'dev' && 'ecommerce-dev' || 'ecommerce-prod' }}"
+
+          # Get SonarQube LoadBalancer external IP
+          SONAR_IP=$(kubectl get svc sonarqube -n $NAMESPACE -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+          SONAR_URL="http://${SONAR_IP}:9000"
+          echo "sonar-url=$SONAR_URL" >> $GITHUB_OUTPUT
+
+          echo "SonarQube URL: $SONAR_URL"
+
+      - name: Wait for SonarQube to be ready
+        run: |
+          SONAR_URL="${{ steps.sonar-config.outputs.sonar-url }}"
+          MAX_RETRIES=12
+          RETRY_COUNT=0
+
+          echo "Waiting for SonarQube to be ready at $SONAR_URL..."
+
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            STATUS=$(curl -s -o /dev/null -w '%{http_code}' $SONAR_URL/api/system/status || echo "000")
+
+            if [[ "$STATUS" == "200" ]]; then
+              echo "✅ SonarQube is ready!"
+              break
+            fi
+
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+            echo "SonarQube not ready yet (attempt $RETRY_COUNT/$MAX_RETRIES), waiting..."
+            sleep 5
+          done
+
+          if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
+            echo "❌ SonarQube not ready after $MAX_RETRIES attempts"
+            exit 1
+          fi
+
+      - name: Cache SonarQube packages
         uses: actions/cache@v4
         with:
           path: ~/.sonar/cache
@@ -138,23 +194,23 @@ jobs:
       - name: Run tests with coverage
         run: mvn clean test -B
 
-      - name: Set up JDK 17 for SonarCloud
+      - name: Set up JDK 17 for SonarQube
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
           cache: 'maven'
 
-      - name: SonarCloud Scan
+      - name: SonarQube Scan
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
         run: |
           mvn sonar:sonar \
-            -Dsonar.projectKey=IngesoftV-backend-microservices_${{ inputs.service-name }} \
+            -Dsonar.projectKey=${{ inputs.service-name }} \
             -Dsonar.projectName=${{ inputs.service-name }} \
-            -Dsonar.organization=${{ vars.SONAR_ORGANIZATION }} \
-            -Dsonar.host.url=https://sonarcloud.io \
+            -Dsonar.host.url=${{ steps.sonar-config.outputs.sonar-url }} \
+            -Dsonar.token=$SONAR_TOKEN \
             -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml \
             -Dsonar.java.binaries=target/classes \
             -Dsonar.qualitygate.wait=false \
