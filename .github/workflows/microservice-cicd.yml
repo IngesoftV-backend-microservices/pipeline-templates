@@ -121,7 +121,7 @@ jobs:
           java-version: ${{ inputs.java-version }}
           cache: 'maven'
 
-      - name: Azure login
+      - name: Azure login (OIDC)
         uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
@@ -249,7 +249,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Azure login
+      - name: Azure login (OIDC)
         uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
@@ -309,7 +309,7 @@ jobs:
     environment: ${{ inputs.environment }}
 
     steps:
-      - name: Azure login
+      - name: Azure login (OIDC)
         uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
@@ -415,7 +415,7 @@ jobs:
     needs: [deploy-to-aks]
 
     steps:
-      - name: Azure login
+      - name: Azure login (OIDC)
         uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
