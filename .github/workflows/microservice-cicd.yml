@@ -492,11 +492,23 @@ jobs:
           # Get API Gateway LoadBalancer IP
           API_GATEWAY_IP=$(kubectl get svc api-gateway -n $NAMESPACE -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "")
 
+          # Get Proxy Client LoadBalancer IP for authentication
+          PROXY_CLIENT_IP=$(kubectl get svc proxy-client -n $NAMESPACE -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "")
+
           # If LoadBalancer IP not available, use port-forward approach or internal DNS
           if [ -z "$API_GATEWAY_IP" ]; then
             echo "base-host=api-gateway.$NAMESPACE.svc.cluster.local" >> $GITHUB_OUTPUT
           else
             echo "base-host=$API_GATEWAY_IP" >> $GITHUB_OUTPUT
+          fi
+
+          # Set authentication URL
+          if [ -n "$PROXY_CLIENT_IP" ]; then
+            echo "auth-url=http://${PROXY_CLIENT_IP}:8900/app/api/authenticate" >> $GITHUB_OUTPUT
+            echo "Proxy Client URL: http://${PROXY_CLIENT_IP}:8900"
+          else
+            echo "auth-url=http://proxy-client.$NAMESPACE.svc.cluster.local:8900/app/api/authenticate" >> $GITHUB_OUTPUT
+            echo "Using internal DNS for proxy-client"
           fi
 
       - name: Run integration tests
@@ -533,7 +545,10 @@ jobs:
         working-directory: tests
         env:
           BASE_HOST: ${{ steps.endpoints.outputs.base-host }}
+          AUTH_URL: ${{ steps.endpoints.outputs.auth-url }}
           TEST_TIMEOUT: 60
+          DEFAULT_USERNAME: admin
+          DEFAULT_PASSWORD: admin123
         run: |
           SERVICE_NAME="${{ inputs.service-name }}"
           E2E_TEST_FILE="e2e/test_e2e_${SERVICE_NAME//-/_}.py"
@@ -541,11 +556,14 @@ jobs:
           # Check if E2E test file exists
           if [ -f "$E2E_TEST_FILE" ]; then
             echo "Running E2E tests for $SERVICE_NAME"
+            echo "Authentication URL: $AUTH_URL"
+            echo "Base Host: $BASE_HOST"
 
             mkdir -p reports/e2e
 
             pytest $E2E_TEST_FILE \
               -v \
+              -s \
               --html=reports/e2e/report_${SERVICE_NAME}.html \
               --self-contained-html \
               --junitxml=reports/e2e/junit_${SERVICE_NAME}.xml \
