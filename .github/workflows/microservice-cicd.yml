@@ -492,44 +492,50 @@ jobs:
           # Get API Gateway LoadBalancer IP
           API_GATEWAY_IP=$(kubectl get svc api-gateway -n $NAMESPACE -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "")
 
-          # Get Proxy Client LoadBalancer IP for authentication
-          # IMPORTANT: GitHub Actions runners run OUTSIDE the cluster, so internal DNS won't work
-          # We MUST use the LoadBalancer IP
-          echo "Waiting for proxy-client LoadBalancer IP..."
-          MAX_RETRIES=12
-          RETRY_COUNT=0
-          PROXY_CLIENT_IP=""
+          if [ -z "$API_GATEWAY_IP" ]; then
+            echo "❌ ERROR: API Gateway LoadBalancer IP not available"
+            exit 1
+          fi
 
+          echo "base-host=$API_GATEWAY_IP" >> $GITHUB_OUTPUT
+          echo "API Gateway IP: $API_GATEWAY_IP"
+
+      - name: Setup port-forward for proxy-client authentication
+        id: port-forward
+        run: |
+          NAMESPACE="${{ inputs.environment == 'dev' && 'ecommerce-dev' || 'ecommerce-prod' }}"
+          
+          # Start port-forward in background for proxy-client
+          # This avoids needing a LoadBalancer (Azure has public IP quota limits)
+          echo "Starting port-forward for proxy-client..."
+          kubectl port-forward -n $NAMESPACE svc/proxy-client 8900:8900 > /dev/null 2>&1 &
+          PORT_FORWARD_PID=$!
+          echo "port-forward-pid=$PORT_FORWARD_PID" >> $GITHUB_OUTPUT
+          
+          # Wait for port-forward to be ready
+          MAX_RETRIES=10
+          RETRY_COUNT=0
+          
           while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-            PROXY_CLIENT_IP=$(kubectl get svc proxy-client -n $NAMESPACE -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "")
-            
-            if [ -n "$PROXY_CLIENT_IP" ]; then
-              echo "✅ Proxy Client LoadBalancer IP obtained: $PROXY_CLIENT_IP"
+            if curl -s http://localhost:8900/app/actuator/health > /dev/null 2>&1; then
+              echo "✅ Port-forward ready on localhost:8900"
               break
             fi
             
             RETRY_COUNT=$((RETRY_COUNT + 1))
-            echo "Waiting for LoadBalancer IP (attempt $RETRY_COUNT/$MAX_RETRIES)..."
-            sleep 5
+            echo "Waiting for port-forward (attempt $RETRY_COUNT/$MAX_RETRIES)..."
+            sleep 2
           done
-
-          if [ -z "$PROXY_CLIENT_IP" ]; then
-            echo "❌ ERROR: proxy-client LoadBalancer IP not available after $MAX_RETRIES attempts"
-            echo "E2E tests require external access to proxy-client for authentication"
+          
+          if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
+            echo "❌ ERROR: Port-forward not ready after $MAX_RETRIES attempts"
+            kill $PORT_FORWARD_PID 2>/dev/null || true
             exit 1
           fi
-
-          # Set base host for API calls
-          if [ -z "$API_GATEWAY_IP" ]; then
-            echo "⚠️  WARNING: API Gateway LoadBalancer IP not available, using proxy-client IP as fallback"
-            echo "base-host=$PROXY_CLIENT_IP" >> $GITHUB_OUTPUT
-          else
-            echo "base-host=$API_GATEWAY_IP" >> $GITHUB_OUTPUT
-          fi
-
-          # Set authentication URL (must use LoadBalancer IP, not internal DNS)
-          echo "auth-url=http://${PROXY_CLIENT_IP}:8900/app/api/authenticate" >> $GITHUB_OUTPUT
-          echo "Authentication URL: http://${PROXY_CLIENT_IP}:8900/app/api/authenticate"
+          
+          # Set authentication URL to localhost (port-forwarded)
+          echo "auth-url=http://localhost:8900/app/api/authenticate" >> $GITHUB_OUTPUT
+          echo "Authentication URL: http://localhost:8900/app/api/authenticate (via port-forward)"
 
       - name: Run integration tests
         working-directory: tests
@@ -595,6 +601,16 @@ jobs:
             fi
           else
             echo "No E2E tests found for $SERVICE_NAME, skipping"
+          fi
+
+      - name: Cleanup port-forward
+        if: always()
+        run: |
+          # Kill port-forward process
+          PORT_FORWARD_PID="${{ steps.port-forward.outputs.port-forward-pid }}"
+          if [ -n "$PORT_FORWARD_PID" ]; then
+            echo "Cleaning up port-forward (PID: $PORT_FORWARD_PID)"
+            kill $PORT_FORWARD_PID 2>/dev/null || true
           fi
 
       - name: Generate test coverage report
