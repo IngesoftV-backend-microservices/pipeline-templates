@@ -418,29 +418,45 @@ jobs:
           SERVICE_IP=$(kubectl get svc $SERVICE_NAME -n $NAMESPACE -o jsonpath='{.spec.clusterIP}')
           SERVICE_PORT=$(kubectl get svc $SERVICE_NAME -n $NAMESPACE -o jsonpath='{.spec.ports[0].port}')
 
-          # Health check URL with service context path
-          HEALTH_URL="http://$SERVICE_IP:$SERVICE_PORT/$SERVICE_NAME/actuator/health"
-
           echo "Service IP: $SERVICE_IP:$SERVICE_PORT"
-          echo "Health URL: $HEALTH_URL"
 
-          # Run health check from inside cluster using a temporary pod
-          HTTP_CODE=$(kubectl run health-check-pod-${{ github.run_id }} \
+          # URL 1: Con Context Path (Ej: /payment-service/actuator/health)
+          HEALTH_URL_1="http://$SERVICE_IP:$SERVICE_PORT/$SERVICE_NAME/actuator/health"
+          
+          # URL 2: Sin Context Path (Ej: /actuator/health) -> Para Gateway/Eureka/Config
+          HEALTH_URL_2="http://$SERVICE_IP:$SERVICE_PORT/actuator/health"
+
+          echo "Probando URL 1: $HEALTH_URL_1"
+          
+          # Intentar primera URL
+          HTTP_CODE=$(kubectl run health-check-1-${{ github.run_id }} \
             --image=curlimages/curl:latest \
             --restart=Never \
             --namespace=$NAMESPACE \
             --rm -i \
             --command -- \
-            sh -c "curl -s -o /dev/null -w '%{http_code}' $HEALTH_URL" 2>/dev/null || echo "000")
+            sh -c "curl -s -o /dev/null -w '%{http_code}' $HEALTH_URL_1" 2>/dev/null || echo "000")
 
-          echo "HTTP Response Code: $HTTP_CODE"
-
-          # Check if response code starts with 200
           if [[ "$HTTP_CODE" == 200* ]]; then
-            echo "✅ Health check passed for ${{ inputs.service-name }}"
+            echo "Health check passed en URL 1"
           else
-            echo "❌ Health check failed for ${{ inputs.service-name }} (HTTP $HTTP_CODE)"
-            exit 1
+            echo "Falló URL 1 (HTTP $HTTP_CODE). Probando URL 2 (Raíz)..."
+            
+            # Intentar segunda URL si la primera falla
+            HTTP_CODE=$(kubectl run health-check-2-${{ github.run_id }} \
+              --image=curlimages/curl:latest \
+              --restart=Never \
+              --namespace=$NAMESPACE \
+              --rm -i \
+              --command -- \
+              sh -c "curl -s -o /dev/null -w '%{http_code}' $HEALTH_URL_2" 2>/dev/null || echo "000")
+              
+            if [[ "$HTTP_CODE" == 200* ]]; then
+               echo "✅ Health check passed en URL 2 (Raíz)"
+            else
+               echo "❌ Health check failed en ambas URLs (HTTP $HTTP_CODE)"
+               exit 1
+            fi
           fi
 
   integration-e2e-tests:
