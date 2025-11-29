@@ -47,6 +47,9 @@ on:
       GH_PAT:
         description: 'GitHub Personal Access Token for accessing other repositories'
         required: true
+      SLACK_WEBHOOK_URL:
+        description: 'Webhook URL for Slack notifications'
+        required: true
 
 jobs:
   build-and-test:
