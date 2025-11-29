@@ -671,7 +671,7 @@ jobs:
           fi
 
       - name: Send Slack notification
-        if: false  # Disabled for now
+        if: always() # Send notification for both success and failure
         uses: slackapi/slack-github-action@v1
         with:
           payload: |
