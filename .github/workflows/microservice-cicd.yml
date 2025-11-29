@@ -571,7 +571,7 @@ jobs:
         working-directory: tests
         env:
           BASE_HOST: ${{ steps.endpoints.outputs.base-host }}
-          AUTH_URL: ${{ steps.endpoints.outputs.auth-url }}
+          AUTH_URL: ${{ steps.port-forward.outputs.auth-url }}
           TEST_TIMEOUT: 60
           DEFAULT_USERNAME: admin
           DEFAULT_PASSWORD: admin123
