@@ -328,13 +328,279 @@ jobs:
           exit-code: '0'
           severity: 'CRITICAL,HIGH'
 
-      - name: Create Git tag
+      - name: Create annotated Git tag with metadata
         if: inputs.environment == 'prod'
         run: |
           git config user.name "GitHub Actions"
           git config user.email "actions@github.com"
-          git tag -a "${{ needs.build-and-test.outputs.image-tag }}" -m "Release ${{ needs.build-and-test.outputs.image-tag }}"
+          
+          # Generar mensaje del tag con metadata
+          TAG_MESSAGE="Release ${{ needs.build-and-test.outputs.image-tag }}
+
+          Service: ${{ inputs.service-name }}
+          Environment: ${{ inputs.environment }}
+          Build Date: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          Commit: ${{ github.sha }}
+          Triggered by: ${{ github.actor }}
+          Workflow Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          
+          Image: ${{ steps.acr.outputs.login-server }}/${{ inputs.service-name }}:${{ needs.build-and-test.outputs.image-tag }}"
+          
+          # Crear tag anotado
+          git tag -a "${{ needs.build-and-test.outputs.image-tag }}" -m "$TAG_MESSAGE"
           git push origin "${{ needs.build-and-test.outputs.image-tag }}"
+          
+          echo "Tag creado: ${{ needs.build-and-test.outputs.image-tag }}"
+
+  create-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: [build-and-test, build-and-push-image]
+    if: inputs.environment == 'prod'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Fetch all history for better release notes
+      
+      - name: Get previous tag
+        id: previous-tag
+        run: |
+          # Obtener el tag anterior
+          PREVIOUS_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          
+          if [ -z "$PREVIOUS_TAG" ]; then
+            echo "No previous tag found, using first commit"
+            PREVIOUS_TAG=$(git rev-list --max-parents=0 HEAD)
+          fi
+          
+          echo "previous-tag=$PREVIOUS_TAG" >> $GITHUB_OUTPUT
+          echo "Previous tag: $PREVIOUS_TAG"
+      
+      - name: Generate release notes
+        id: release-notes
+        run: |
+          CURRENT_TAG="${{ needs.build-and-test.outputs.image-tag }}"
+          PREVIOUS_TAG="${{ steps.previous-tag.outputs.previous-tag }}"
+          
+          echo "Generating release notes from $PREVIOUS_TAG to $CURRENT_TAG"
+          
+          # Crear archivo de release notes
+          cat > release-notes.md <<EOF
+          ## Release $CURRENT_TAG
+          
+          **Service:** ${{ inputs.service-name }}
+          **Date:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          **Environment:** ${{ inputs.environment }}
+          
+          ### Changes
+          
+          EOF
+          
+          # Obtener commits desde el tag anterior
+          COMMITS=$(git log $PREVIOUS_TAG..HEAD --pretty=format:"%h|%s|%an" --no-merges)
+          
+          # Categorizar commits por tipo (conventional commits)
+          FEATURES=$(echo "$COMMITS" | grep -E "^[a-f0-9]+\|feat" || true)
+          FIXES=$(echo "$COMMITS" | grep -E "^[a-f0-9]+\|fix" || true)
+          BREAKING=$(echo "$COMMITS" | grep -E "^[a-f0-9]+\|(feat|fix)!" || true)
+          DOCS=$(echo "$COMMITS" | grep -E "^[a-f0-9]+\|docs" || true)
+          CHORES=$(echo "$COMMITS" | grep -E "^[a-f0-9]+\|(chore|ci|refactor|perf|style|test)" || true)
+          
+          # Agregar breaking changes
+          if [ -n "$BREAKING" ]; then
+            echo "### ⚠️ Breaking Changes" >> release-notes.md
+            echo "" >> release-notes.md
+            echo "$BREAKING" | while IFS='|' read -r hash message author; do
+              # Limpiar el mensaje
+              clean_message=$(echo "$message" | sed 's/^[a-z]*!*: //')
+              echo "- **${clean_message}** (${hash}) by ${author}" >> release-notes.md
+            done
+            echo "" >> release-notes.md
+          fi
+          
+          # Agregar features
+          if [ -n "$FEATURES" ]; then
+            echo "### ✨ Features" >> release-notes.md
+            echo "" >> release-notes.md
+            echo "$FEATURES" | while IFS='|' read -r hash message author; do
+              clean_message=$(echo "$message" | sed 's/^feat: //')
+              echo "- ${clean_message} (${hash})" >> release-notes.md
+            done
+            echo "" >> release-notes.md
+          fi
+          
+          # Agregar fixes
+          if [ -n "$FIXES" ]; then
+            echo "### 🐛 Bug Fixes" >> release-notes.md
+            echo "" >> release-notes.md
+            echo "$FIXES" | while IFS='|' read -r hash message author; do
+              clean_message=$(echo "$message" | sed 's/^fix: //')
+              echo "- ${clean_message} (${hash})" >> release-notes.md
+            done
+            echo "" >> release-notes.md
+          fi
+          
+          # Agregar documentación
+          if [ -n "$DOCS" ]; then
+            echo "### 📚 Documentation" >> release-notes.md
+            echo "" >> release-notes.md
+            echo "$DOCS" | while IFS='|' read -r hash message author; do
+              clean_message=$(echo "$message" | sed 's/^docs: //')
+              echo "- ${clean_message} (${hash})" >> release-notes.md
+            done
+            echo "" >> release-notes.md
+          fi
+          
+          # Agregar otros cambios
+          if [ -n "$CHORES" ]; then
+            echo "### 🔧 Other Changes" >> release-notes.md
+            echo "" >> release-notes.md
+            echo "$CHORES" | while IFS='|' read -r hash message author; do
+              clean_message=$(echo "$message" | sed 's/^[a-z]*: //')
+              echo "- ${clean_message} (${hash})" >> release-notes.md
+            done
+            echo "" >> release-notes.md
+          fi
+          
+          # Agregar información técnica
+          cat >> release-notes.md <<EOF
+          ### 📦 Deployment Information
+          
+          - **Docker Image:** \`${{ needs.build-and-push-image.outputs.login-server }}/${{ inputs.service-name }}:$CURRENT_TAG\`
+          - **Commit SHA:** \`${{ github.sha }}\`
+          - **Triggered by:** @${{ github.actor }}
+          - **Workflow Run:** [View Details](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          
+          ### 🔄 Rollback Instructions
+          
+          If you need to rollback this deployment:
+          
+          1. **Using GitHub Actions Workflow:**
+             - Go to Actions → Rollback to Previous Version
+             - Select service: ${{ inputs.service-name }}
+             - Select environment: ${{ inputs.environment }}
+             - Enter target version: $PREVIOUS_TAG
+          
+          2. **Using kubectl:**
+             \`\`\`bash
+             kubectl rollout undo deployment/${{ inputs.service-name }} -n ecommerce-${{ inputs.environment }}
+             \`\`\`
+          
+          3. **Using rollback script:**
+             \`\`\`bash
+             ./scripts/rollback-service.sh ${{ inputs.service-name }} ${{ inputs.environment }} $PREVIOUS_TAG
+             \`\`\`
+          
+          For detailed rollback procedures, see [ROLLBACK-PLAN.md](https://github.com/IngesoftV-backend-microservices/pipeline-templates/blob/main/ROLLBACK-PLAN.md)
+          EOF
+          
+          # Mostrar las release notes
+          echo "Generated release notes:"
+          cat release-notes.md
+      
+      - name: Create GitHub Release
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const releaseNotes = fs.readFileSync('release-notes.md', 'utf8');
+            
+            try {
+              const release = await github.rest.repos.createRelease({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag_name: '${{ needs.build-and-test.outputs.image-tag }}',
+                name: 'Release ${{ needs.build-and-test.outputs.image-tag }}',
+                body: releaseNotes,
+                draft: false,
+                prerelease: false
+              });
+              
+              console.log(`Release created: ${release.data.html_url}`);
+              
+              // También crear un comment en el PR si existe
+              if (context.payload.pull_request) {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.payload.pull_request.number,
+                  body: `🚀 Release ${{ needs.build-and-test.outputs.image-tag }} has been created!\n\nView release: ${release.data.html_url}`
+                });
+              }
+            } catch (error) {
+              if (error.status === 422 && error.message.includes('already_exists')) {
+                console.log('Release already exists, updating it...');
+                
+                // Obtener el release existente
+                const releases = await github.rest.repos.listReleases({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo
+                });
+                
+                const existingRelease = releases.data.find(r => r.tag_name === '${{ needs.build-and-test.outputs.image-tag }}');
+                
+                if (existingRelease) {
+                  await github.rest.repos.updateRelease({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    release_id: existingRelease.id,
+                    body: releaseNotes
+                  });
+                  console.log('Release updated successfully');
+                }
+              } else {
+                throw error;
+              }
+            }
+      
+      - name: Update CHANGELOG
+        run: |
+          CURRENT_TAG="${{ needs.build-and-test.outputs.image-tag }}"
+          RELEASE_DATE=$(date -u +"%Y-%m-%d")
+          
+          # Verificar si existe CHANGELOG.md
+          if [ ! -f CHANGELOG.md ]; then
+            echo "# Changelog" > CHANGELOG.md
+            echo "" >> CHANGELOG.md
+            echo "All notable changes to this project will be documented in this file." >> CHANGELOG.md
+            echo "" >> CHANGELOG.md
+            echo "The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)," >> CHANGELOG.md
+            echo "and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)." >> CHANGELOG.md
+            echo "" >> CHANGELOG.md
+          fi
+          
+          # Crear entrada temporal con las release notes
+          cat > changelog-entry.md <<EOF
+          ## [$CURRENT_TAG] - $RELEASE_DATE
+          
+          EOF
+          
+          # Agregar el contenido de release notes (sin el header)
+          tail -n +5 release-notes.md | head -n -20 >> changelog-entry.md
+          
+          # Insertar la entrada después de la línea "# Changelog"
+          if grep -q "^## \[" CHANGELOG.md; then
+            # Ya hay entradas, insertar antes de la primera entrada
+            sed -i "/^## \[/r /dev/stdin" CHANGELOG.md < <(cat changelog-entry.md && echo "")
+          else
+            # No hay entradas, agregar al final
+            cat changelog-entry.md >> CHANGELOG.md
+          fi
+          
+          # Commit y push del CHANGELOG actualizado
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          
+          git add CHANGELOG.md
+          
+          if ! git diff --cached --quiet; then
+            git commit -m "docs: update CHANGELOG for $CURRENT_TAG [skip ci]"
+            git push origin HEAD:${{ github.ref_name }}
+          else
+            echo "No changes to CHANGELOG.md"
+          fi
 
   deploy-to-aks:
     name: Deploy to AKS
