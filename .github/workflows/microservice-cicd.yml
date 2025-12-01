@@ -38,6 +38,9 @@ on:
       AZURE_CLIENT_ID:
         description: 'Azure Client ID for OIDC authentication'
         required: true
+      AZURE_CLIENT_ID_ENV:
+        description: 'Azure Client ID for OIDC authentication in environments (deploy job)'
+        required: true
       AZURE_TENANT_ID:
         description: 'Azure Tenant ID'
         required: true
@@ -612,7 +615,7 @@ jobs:
       - name: Azure login (OIDC)
         uses: azure/login@v2
         with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          client-id: ${{ secrets.AZURE_CLIENT_ID_ENV }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
@@ -734,7 +737,7 @@ jobs:
       - name: Azure login (OIDC)
         uses: azure/login@v2
         with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          client-id: ${{ secrets.AZURE_CLIENT_ID_ENV }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
