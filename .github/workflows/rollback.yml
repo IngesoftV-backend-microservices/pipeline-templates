@@ -1,0 +1,434 @@
+name: Rollback to Previous Version
+
+on:
+  workflow_dispatch:
+    inputs:
+      service-name:
+        description: 'Nombre del microservicio a revertir'
+        required: true
+        type: choice
+        options:
+          - api-gateway
+          - cloud-config
+          - service-discovery
+          - user-service
+          - order-service
+          - payment-service
+          - product-service
+          - shipping-service
+          - favourite-service
+          - proxy-client
+      environment:
+        description: 'Ambiente donde se realizará el rollback'
+        required: true
+        type: choice
+        options:
+          - dev
+          - prod
+      target-version:
+        description: 'Versión objetivo para rollback (ej: v1.2.0)'
+        required: true
+        type: string
+      reason:
+        description: 'Razón del rollback'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  packages: write
+  id-token: write
+  deployments: write
+
+jobs:
+  validate-rollback:
+    name: Validar Solicitud de Rollback
+    runs-on: ubuntu-latest
+    outputs:
+      validated: ${{ steps.validate.outputs.validated }}
+
+    steps:
+      - name: Validar formato de versión
+        id: validate
+        run: |
+          TARGET_VERSION="${{ inputs.target-version }}"
+          
+          # Validar formato semver
+          if [[ ! "$TARGET_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-dev)?$ ]]; then
+            echo "ERROR: Formato de versión inválido. Use formato vX.Y.Z o vX.Y.Z-dev"
+            exit 1
+          fi
+          
+          # Validar consistencia ambiente-versión
+          if [[ "${{ inputs.environment }}" == "dev" ]] && [[ ! "$TARGET_VERSION" =~ -dev$ ]]; then
+            echo "WARNING: Versión sin sufijo -dev para ambiente dev"
+          fi
+          
+          if [[ "${{ inputs.environment }}" == "prod" ]] && [[ "$TARGET_VERSION" =~ -dev$ ]]; then
+            echo "ERROR: No se puede usar versión de desarrollo en producción"
+            exit 1
+          fi
+          
+          echo "validated=true" >> $GITHUB_OUTPUT
+          echo "Validación exitosa: $TARGET_VERSION para ambiente ${{ inputs.environment }}"
+
+  rollback:
+    name: Ejecutar Rollback
+    runs-on: ubuntu-latest
+    needs: validate-rollback
+    environment: ${{ inputs.environment }}
+
+    steps:
+      - name: Notificar inicio de rollback
+        if: always()
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload: |
+            {
+              "text": "⚠️ ROLLBACK EN PROGRESO",
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "⚠️ ROLLBACK INICIADO"
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Servicio:*\n${{ inputs.service-name }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Ambiente:*\n${{ inputs.environment }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Versión Objetivo:*\n${{ inputs.target-version }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Ejecutado por:*\n${{ github.actor }}"
+                    }
+                  ]
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Razón:*\n${{ inputs.reason }}"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+        continue-on-error: true
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Set deployment variables
+        id: vars
+        run: |
+          if [ "${{ inputs.environment }}" == "dev" ]; then
+            echo "namespace=ecommerce-dev" >> $GITHUB_OUTPUT
+            echo "cluster-name=${{ vars.AKS_CLUSTER_DEV }}" >> $GITHUB_OUTPUT
+            echo "resource-group=${{ vars.AKS_RG_DEV }}" >> $GITHUB_OUTPUT
+            echo "acr-name=${{ vars.ACR_NAME_DEV }}" >> $GITHUB_OUTPUT
+            echo "acr-server=${{ vars.ACR_NAME_DEV }}.azurecr.io" >> $GITHUB_OUTPUT
+          else
+            echo "namespace=ecommerce-prod" >> $GITHUB_OUTPUT
+            echo "cluster-name=${{ vars.AKS_CLUSTER_PROD }}" >> $GITHUB_OUTPUT
+            echo "resource-group=${{ vars.AKS_RG_PROD }}" >> $GITHUB_OUTPUT
+            echo "acr-name=${{ vars.ACR_NAME_PROD }}" >> $GITHUB_OUTPUT
+            echo "acr-server=${{ vars.ACR_NAME_PROD }}.azurecr.io" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Get AKS credentials
+        run: |
+          az aks get-credentials \
+            --resource-group ${{ steps.vars.outputs.resource-group }} \
+            --name ${{ steps.vars.outputs.cluster-name }} \
+            --overwrite-existing
+
+      - name: Obtener versión actual
+        id: current
+        run: |
+          CURRENT_IMAGE=$(kubectl get deployment ${{ inputs.service-name }} \
+            -n ${{ steps.vars.outputs.namespace }} \
+            -o jsonpath='{.spec.template.spec.containers[0].image}' || echo "")
+          
+          if [ -z "$CURRENT_IMAGE" ]; then
+            echo "ERROR: No se pudo obtener la imagen actual"
+            exit 1
+          fi
+          
+          CURRENT_VERSION=$(echo $CURRENT_IMAGE | awk -F':' '{print $2}')
+          echo "current-version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+          echo "current-image=$CURRENT_IMAGE" >> $GITHUB_OUTPUT
+          
+          echo "Versión actual: $CURRENT_VERSION"
+          echo "Imagen actual: $CURRENT_IMAGE"
+
+      - name: Verificar que versión objetivo existe en ACR
+        run: |
+          az acr login --name ${{ steps.vars.outputs.acr-name }}
+          
+          echo "Verificando ${{ inputs.service-name }}:${{ inputs.target-version }} en ACR..."
+          
+          if ! az acr repository show-tags \
+              --name ${{ steps.vars.outputs.acr-name }} \
+              --repository ${{ inputs.service-name }} \
+              --output table | grep -q "${{ inputs.target-version }}"; then
+            echo "ERROR: La versión ${{ inputs.target-version }} no existe en ACR"
+            echo "Versiones disponibles:"
+            az acr repository show-tags \
+              --name ${{ steps.vars.outputs.acr-name }} \
+              --repository ${{ inputs.service-name }} \
+              --orderby time_desc \
+              --output table | head -10
+            exit 1
+          fi
+          
+          echo "Versión encontrada en ACR"
+
+      - name: Crear backup del deployment actual
+        run: |
+          BACKUP_DIR="/tmp/rollback-backup-$(date +%Y%m%d-%H%M%S)"
+          mkdir -p $BACKUP_DIR
+          
+          kubectl get deployment ${{ inputs.service-name }} \
+            -n ${{ steps.vars.outputs.namespace }} \
+            -o yaml > "$BACKUP_DIR/deployment.yaml"
+          
+          echo "Backup guardado en: $BACKUP_DIR"
+          echo "BACKUP_DIR=$BACKUP_DIR" >> $GITHUB_ENV
+
+      - name: Ejecutar rollback
+        id: rollback
+        run: |
+          TARGET_IMAGE="${{ steps.vars.outputs.acr-server }}/${{ inputs.service-name }}:${{ inputs.target-version }}"
+          
+          echo "Cambiando imagen a: $TARGET_IMAGE"
+          
+          kubectl set image deployment/${{ inputs.service-name }} \
+            ${{ inputs.service-name }}=$TARGET_IMAGE \
+            -n ${{ steps.vars.outputs.namespace }}
+          
+          echo "Comando de rollback ejecutado"
+
+      - name: Esperar completación del rollout
+        run: |
+          echo "Esperando completación del rollout (timeout: 5 minutos)..."
+          
+          if kubectl rollout status deployment/${{ inputs.service-name }} \
+              -n ${{ steps.vars.outputs.namespace }} \
+              --timeout=5m; then
+            echo "Rollout completado exitosamente"
+          else
+            echo "ERROR: Rollout falló o timeout"
+            echo "Para revertir este rollback, use la versión: ${{ steps.current.outputs.current-version }}"
+            exit 1
+          fi
+
+      - name: Verificar estado de pods
+        run: |
+          echo "Estado de los pods después del rollback:"
+          kubectl get pods -n ${{ steps.vars.outputs.namespace }} -l app=${{ inputs.service-name }}
+
+      - name: Health check
+        run: |
+          SERVICE_NAME="${{ inputs.service-name }}"
+          NAMESPACE="${{ steps.vars.outputs.namespace }}"
+          
+          SERVICE_IP=$(kubectl get svc $SERVICE_NAME -n $NAMESPACE -o jsonpath='{.spec.clusterIP}')
+          SERVICE_PORT=$(kubectl get svc $SERVICE_NAME -n $NAMESPACE -o jsonpath='{.spec.ports[0].port}')
+          
+          echo "Ejecutando health check en $SERVICE_IP:$SERVICE_PORT..."
+          
+          # URL con context path
+          HEALTH_URL_1="http://$SERVICE_IP:$SERVICE_PORT/$SERVICE_NAME/actuator/health"
+          # URL sin context path
+          HEALTH_URL_2="http://$SERVICE_IP:$SERVICE_PORT/actuator/health"
+          
+          # Intentar primera URL
+          HTTP_CODE=$(kubectl run health-check-rollback-${{ github.run_id }} \
+            --image=curlimages/curl:latest \
+            --restart=Never \
+            --namespace=$NAMESPACE \
+            --rm -i \
+            --command -- \
+            sh -c "curl -s -o /dev/null -w '%{http_code}' $HEALTH_URL_1" 2>/dev/null || echo "000")
+          
+          if [[ "$HTTP_CODE" == 200* ]]; then
+            echo "Health check exitoso (URL con context path)"
+          else
+            echo "Health check falló en URL 1, intentando URL 2..."
+            
+            HTTP_CODE=$(kubectl run health-check-rollback-2-${{ github.run_id }} \
+              --image=curlimages/curl:latest \
+              --restart=Never \
+              --namespace=$NAMESPACE \
+              --rm -i \
+              --command -- \
+              sh -c "curl -s -o /dev/null -w '%{http_code}' $HEALTH_URL_2" 2>/dev/null || echo "000")
+            
+            if [[ "$HTTP_CODE" == 200* ]]; then
+              echo "Health check exitoso (URL raíz)"
+            else
+              echo "WARNING: Health check falló en ambas URLs (HTTP $HTTP_CODE)"
+              echo "Verifique manualmente el estado del servicio"
+            fi
+          fi
+
+      - name: Generar reporte de rollback
+        if: always()
+        run: |
+          cat > rollback-report.md <<EOF
+          # Reporte de Rollback
+          
+          **Fecha:** $(date)
+          **Ejecutado por:** ${{ github.actor }}
+          
+          ## Información del Servicio
+          - **Servicio:** ${{ inputs.service-name }}
+          - **Ambiente:** ${{ inputs.environment }} (${{ steps.vars.outputs.namespace }})
+          - **Versión anterior:** ${{ steps.current.outputs.current-version }}
+          - **Versión objetivo:** ${{ inputs.target-version }}
+          - **Razón:** ${{ inputs.reason }}
+          
+          ## Infraestructura
+          - **AKS Cluster:** ${{ steps.vars.outputs.cluster-name }}
+          - **Resource Group:** ${{ steps.vars.outputs.resource-group }}
+          - **ACR:** ${{ steps.vars.outputs.acr-name }}
+          
+          ## Status Final
+          \`\`\`
+          $(kubectl get deployment ${{ inputs.service-name }} -n ${{ steps.vars.outputs.namespace }} 2>/dev/null || echo "Error al obtener deployment")
+          \`\`\`
+          
+          ## Próximos Pasos
+          1. Monitorear métricas en Grafana
+          2. Revisar logs del servicio
+          3. Ejecutar smoke tests
+          4. Validar funcionalidad crítica
+          5. Documentar incidente en post-mortem
+          EOF
+          
+          cat rollback-report.md
+
+      - name: Crear issue de seguimiento
+        uses: actions/github-script@v7
+        if: always()
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `[ROLLBACK] ${{ inputs.service-name }} - ${{ inputs.environment }} - ${{ inputs.target-version }}`,
+              body: `## Rollback Ejecutado
+              
+              Se realizó un rollback del servicio **${{ inputs.service-name }}** en ambiente **${{ inputs.environment }}**.
+              
+              ### Detalles
+              - **Versión anterior:** ${{ steps.current.outputs.current-version }}
+              - **Versión objetivo:** ${{ inputs.target-version }}
+              - **Razón:** ${{ inputs.reason }}
+              - **Ejecutado por:** @${{ github.actor }}
+              - **Fecha:** ${new Date().toISOString()}
+              
+              ### Workflow
+              - **Run ID:** ${{ github.run_id }}
+              - **URL:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+              
+              ### Checklist Post-Rollback
+              - [ ] Monitoreo de métricas validado
+              - [ ] Logs revisados
+              - [ ] Smoke tests ejecutados
+              - [ ] Funcionalidad crítica verificada
+              - [ ] Post-mortem programado
+              - [ ] Lecciones aprendidas documentadas
+              
+              ### Próximos Pasos
+              1. Validar que el servicio funciona correctamente
+              2. Identificar causa raíz del problema original
+              3. Programar post-mortem
+              4. Actualizar tests/documentación si es necesario
+              `,
+              labels: ['rollback', 'incident', `env:${{ inputs.environment }}`]
+            });
+
+      - name: Notificar resultado
+        if: always()
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload: |
+            {
+              "text": "${{ job.status == 'success' && '✅ ROLLBACK COMPLETADO' || '❌ ROLLBACK FALLIDO' }}",
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "${{ job.status == 'success' && '✅ ROLLBACK COMPLETADO' || '❌ ROLLBACK FALLIDO' }}"
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Servicio:*\n${{ inputs.service-name }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Ambiente:*\n${{ inputs.environment }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Versión:*\n${{ inputs.target-version }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Status:*\n${{ job.status }}"
+                    }
+                  ]
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Razón:*\n${{ inputs.reason }}"
+                  }
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "Ver Workflow"
+                      },
+                      "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+        continue-on-error: true
