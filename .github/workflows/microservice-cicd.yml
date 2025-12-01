@@ -237,6 +237,7 @@ jobs:
             -Dsonar.projectName=${{ inputs.service-name }} \
             -Dsonar.host.url=${{ steps.sonar-config.outputs.sonar-url }} \
             -Dsonar.login="${SONAR_TOKEN}" \
+            -Dsonar.branch.name=${{ github.ref_name }} \
             -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml \
             -Dsonar.java.binaries=target/classes \
             -Dsonar.qualitygate.wait=false \
