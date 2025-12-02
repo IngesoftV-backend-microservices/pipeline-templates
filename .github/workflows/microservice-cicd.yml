@@ -32,8 +32,11 @@ on:
         type: boolean
         default: false
     secrets:
-      SONAR_TOKEN:
-        description: 'SonarQube authentication token'
+      SONAR_TOKEN_DEV:
+        description: 'SonarQube authentication token for DEV environment'
+        required: true
+      SONAR_TOKEN_PROD:
+        description: 'SonarQube authentication token for PROD environment'
         required: true
       AZURE_CLIENT_ID:
         description: 'Azure Client ID for OIDC authentication'
@@ -216,9 +219,20 @@ jobs:
           java-version: '17'
           cache: 'maven'
 
+      - name: Set SonarQube token
+        id: sonar-token
+        run: |
+          if [ "${{ inputs.environment }}" == "dev" ]; then
+            echo "token=${{ secrets.SONAR_TOKEN_DEV }}" >> $GITHUB_OUTPUT
+            echo "Using DEV SonarQube token"
+          else
+            echo "token=${{ secrets.SONAR_TOKEN_PROD }}" >> $GITHUB_OUTPUT
+            echo "Using PROD SonarQube token"
+          fi
+
       - name: Debug - Check SONAR_TOKEN
         env:
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_TOKEN: ${{ steps.sonar-token.outputs.token }}
         run: |
           if [ -z "$SONAR_TOKEN" ]; then
             echo "ERROR: SONAR_TOKEN is empty!"
@@ -230,7 +244,7 @@ jobs:
       - name: SonarQube Scan
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_TOKEN: ${{ steps.sonar-token.outputs.token }}
         run: |
           mvn sonar:sonar \
             -Dsonar.projectKey=${{ inputs.service-name }} \
